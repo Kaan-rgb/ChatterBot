@@ -8,6 +8,9 @@ from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 import os
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from urllib.parse import urldefrag
 
 # Newspaper imports kept lazy to allow running without optional deps during setup
 try:
@@ -23,11 +26,15 @@ from cleaner import clean_corpus
 CORPUS_FILE = "chat.txt"
 CRAWL_INTERVAL = 3600  # seconds
 MAX_LINKS_PER_BASE = 5
+TRAIN_TTL_SECONDS = 6 * 3600  # avoid retraining same URL too often
+MAX_TRAIN_LINES_PER_URL = 200
 
 
 # --- Global state ---
 gui = None  # will be set after Tk init
 trainer_lock = threading.Lock()
+stop_event = threading.Event()
+last_trained_at = {}
 
 
 # --- Initialize chatbot ---
@@ -46,6 +53,49 @@ def safe_gui_status(message: str) -> None:
     except Exception:
         # Fallback to direct call if not in Tk thread yet
         gui.append_status(message)
+
+
+def is_valid_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+        return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+    except Exception:
+        return False
+
+
+def normalize_url(url: str) -> str:
+    try:
+        clean, _ = urldefrag(url)
+        return clean
+    except Exception:
+        return url.split("#")[0]
+
+
+def should_train_url(url: str) -> bool:
+    now = time.time()
+    last = last_trained_at.get(url)
+    if last is None:
+        return True
+    return (now - last) >= TRAIN_TTL_SECONDS
+
+
+def mark_trained(url: str) -> None:
+    last_trained_at[url] = time.time()
+
+
+def get_retrying_session() -> requests.Session:
+    session = requests.Session()
+    retry = Retry(
+        total=3,
+        backoff_factor=0.5,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("GET", "HEAD"),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
 
 
 # --- Train from local file if exists ---
@@ -84,6 +134,13 @@ def train_from_url(url: str) -> None:
         safe_gui_status("⚠️ Newspaper3k not installed; skipping URL training.")
         return
     try:
+        url = normalize_url(url)
+        if not is_valid_url(url):
+            safe_gui_status(f"⚠️ Invalid URL skipped: {url}")
+            return
+        if not should_train_url(url):
+            safe_gui_status(f"⏭️ Skipping recently trained URL: {url}")
+            return
         config = Configuration()
         config.request_timeout = 10
         config.browser_user_agent = (
@@ -100,9 +157,19 @@ def train_from_url(url: str) -> None:
         text = article.text or ""
         if len(text) > 100:
             lines = [line.strip() for line in text.split("\n") if len(line.strip()) > 20]
+            # Deduplicate while preserving order
+            seen = set()
+            deduped = []
+            for line in lines:
+                if line not in seen:
+                    deduped.append(line)
+                    seen.add(line)
+            # Limit number of lines to train per URL
+            limited = deduped[:MAX_TRAIN_LINES_PER_URL]
             if lines:
                 with trainer_lock:
-                    trainer.train(lines)
+                    trainer.train(limited)
+                mark_trained(url)
                 safe_gui_status(f"✅ Trained from: {url}")
             else:
                 safe_gui_status(f"⚠️ Extracted no substantial lines at: {url}")
@@ -115,6 +182,11 @@ def train_from_url(url: str) -> None:
 # --- Crawl base URLs ---
 def crawl_and_train(base_url: str) -> None:
     try:
+        base_url = normalize_url(base_url)
+        if not is_valid_url(base_url):
+            safe_gui_status(f"⚠️ Invalid base URL: {base_url}")
+            return
+        session = get_retrying_session()
         headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -122,7 +194,7 @@ def crawl_and_train(base_url: str) -> None:
                 "Chrome/140.0.0.0 Safari/537.36"
             )
         }
-        response = requests.get(base_url, headers=headers, timeout=10)
+        response = session.get(base_url, headers=headers, timeout=10)
         if response.status_code != 200:
             safe_gui_status(f"⚠️ Failed to fetch {base_url}")
             return
@@ -130,15 +202,23 @@ def crawl_and_train(base_url: str) -> None:
         soup = BeautifulSoup(response.text, "html.parser")
         for a_tag in soup.find_all("a", href=True):
             href = a_tag["href"]
-            full_url = urljoin(base_url, href)
-            if urlparse(full_url).netloc == urlparse(base_url).netloc:
+            full_url = normalize_url(urljoin(base_url, href))
+            # Filter same host, valid scheme, and avoid obvious binaries
+            if (
+                is_valid_url(full_url)
+                and urlparse(full_url).netloc == urlparse(base_url).netloc
+                and not any(full_url.lower().endswith(ext) for ext in (".pdf", ".zip", ".jpg", ".png", ".gif"))
+            ):
                 soup_links.add(full_url)
             if len(soup_links) >= MAX_LINKS_PER_BASE:
                 break
         # Train from base URL
-        train_from_url(base_url)
+        if not stop_event.is_set():
+            train_from_url(base_url)
         # Train from discovered links
         for link in soup_links:
+            if stop_event.is_set():
+                break
             train_from_url(link)
     except Exception as e:
         safe_gui_status(f"⚠️ Error crawling {base_url}: {e}")
@@ -146,12 +226,15 @@ def crawl_and_train(base_url: str) -> None:
 
 # --- Periodic background training ---
 def periodic_training() -> None:
-    while True:
+    while not stop_event.is_set():
         safe_gui_status("⏳ Starting periodic training...")
         for url in list(base_urls):
+            if stop_event.is_set():
+                break
             crawl_and_train(url)
         safe_gui_status(f"✅ Training cycle completed. Waiting {CRAWL_INTERVAL} seconds...")
-        time.sleep(CRAWL_INTERVAL)
+        if stop_event.wait(CRAWL_INTERVAL):
+            break
 
 
 # --- GUI Class ---
@@ -159,6 +242,7 @@ class ChatBotGUI(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Chatpot 🌱")
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
 
         # Chat area
         self.chat_area = scrolledtext.ScrolledText(self, wrap=tk.WORD, width=60, height=20)
@@ -214,9 +298,13 @@ class ChatBotGUI(tk.Tk):
     def add_url(self):
         new_url = simpledialog.askstring("Add URL", "Enter the URL to train from:")
         if new_url:
-            base_urls.append(new_url)
-            self.append_status(f"Added URL: {new_url}")
-            threading.Thread(target=crawl_and_train, args=(new_url,), daemon=True).start()
+            new_url = normalize_url(new_url)
+            if is_valid_url(new_url):
+                base_urls.append(new_url)
+                self.append_status(f"Added URL: {new_url}")
+                threading.Thread(target=crawl_and_train, args=(new_url,), daemon=True).start()
+            else:
+                self.append_status(f"⚠️ Invalid URL: {new_url}")
 
     def remove_url(self):
         if base_urls:
@@ -224,6 +312,12 @@ class ChatBotGUI(tk.Tk):
             self.append_status(f"Removed URL: {removed_url}")
         else:
             self.append_status("No URLs to remove.")
+
+    def on_close(self):
+        try:
+            stop_event.set()
+        finally:
+            self.destroy()
 
 
 # --- Run GUI and background training ---
