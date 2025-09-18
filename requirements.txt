@@ -1,0 +1,10 @@
+chatterbot==1.0.8
+SQLAlchemy<2.0
+spacy<3.0
+pyyaml
+python-dateutil
+pytz
+mathparse
+requests
+beautifulsoup4
+newspaper3k
